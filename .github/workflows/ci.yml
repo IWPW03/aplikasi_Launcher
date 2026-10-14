@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main, 'release/**']
+  # `labeled` and `unlabeled` are here for the release-rules job: its waivers are labels, and without these a pull
+  # request stays red after you label it until someone pushes a commit, which teaches people to ignore the check.
+  # `edited` for the same reason: REL-5 reads the description, so fixing the description has to rerun it.
+  pull_request:
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
+  schedule:
+    - cron: '17 4 * * 1' # weekly fuzzing
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: 17
+      # Also validates the Gradle wrapper jar.
+      - uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6.4.0
+      # Before anything slow: a key in the repository is the one mistake that can't be taken back by deleting it.
+      - name: No private keys in the repository
+        run: bash tools/check-secrets.sh
+      # PERMISSIONS.md tells readers they can check it against the manifest. This is that check, both ways, so the
+      # document cannot go on promising a list the app no longer matches (docs/standards/site.md, WEB-3).
+      - name: PERMISSIONS.md lists exactly the permissions the manifest declares
+        run: python3 tools/check-permissions.py
+      # Folio's own packages are the SDK's worked examples, so they have to pass the validator authors are told to
+      # run. The Kotlin parser and the published schemas are separate lists, and this is what keeps them agreeing.
+      - name: Folio's own packages pass the SDK validator
+        run: python3 tools/folio-pkg.py validate docs/sdk/source
+      - name: Unit tests, lint and debug build
+        run: ./gradlew :app:testDebugUnitTest :market:testDebugUnitTest :app:lintDebug :market:lintDebug :app:assembleDebug
+
+  # The parts of the releases standard a machine can see: a change to what ships carries its own changelog line,
+  # and a version bump comes on its own (docs/standards/releases.md, REL-7 and REL-13). Pull requests only, since
+  # both rules are about what a pull request contains.
+  release-rules:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Branch, notes and version rules
+        env:
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          PR_BRANCH: ${{ github.head_ref }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: bash tools/check-release-rules.sh "origin/${{ github.base_ref }}"
+
+  # Fuzzes every package parser for five minutes each (Jazzer). Not on every push: it's slow.
+  fuzz:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6.4.0
+      - name: Fuzz the parsers
+        env:
+          JAZZER_FUZZ: 1
+        run: |
+          for target in manifest depiction entry index revoked archive tweaks jsonGuard versions localizedText authorSignature authorPayload; do
+            ./gradlew :market:testDebugUnitTest --tests "*ParserFuzzTest.$target"
+          done
+      - name: Keep any input that failed
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-findings
+          path: |
+            market/src/test/resources/com/mccal/folio/market/ParserFuzzTestInputs/**
+            market/build/reports/tests/**
